@@ -34,13 +34,42 @@ jobs:
       - name: Byte-compile scripts
         run: python -m compileall -q scripts tests
 
-      - name: Smoke test (build a synthetic EPUB, then verify it)
-        run: python tests/smoke_test.py
+      - name: Smoke test (build both font policies, then verify)
+        run: python tests/smoke_test.py --out-dir artifacts
 
       - name: CLI help sanity
         run: |
           python scripts/build_epub.py --help
           python scripts/verify_epub.py --help
+
+  epubcheck:
+    name: EPUBCheck (npm, no Java)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Build artifacts
+        run: python tests/smoke_test.py --out-dir artifacts
+
+      - name: Validate with EPUBCheck
+        run: |
+          set -euo pipefail
+          for f in artifacts/*.epub; do
+            echo "::group::EPUBCheck $f"
+            npx -y epubcheck-standalone-cli@5.4.0-build3 "$f"
+            echo "::endgroup::"
+          done
 
   skill-lint:
     name: SKILL.md frontmatter

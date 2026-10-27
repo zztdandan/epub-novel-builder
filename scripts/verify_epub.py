@@ -10,9 +10,14 @@ Checks (each one corresponds to a real bug that shipped at least once):
       which makes cover art silently fail to load while icons still work.)
   4. Illustrations are within the pixel/size budget.
   5. Chapter icons are exactly square, RGBA, and consistent.
-  6. The required LXGW WenKai Mono font is embedded and referenced.
-  7. No leftover advertisement strings.
-  8. Chapter markup keeps icon and title in separate top-level blocks.
+  6. Navigation: exactly one manifest item with properties="nav", the document
+     exists, and it is NOT in the spine (so no reader renders it as a page),
+     plus a linked toc.ncx with a non-empty navMap for EPUB 2 reading systems.
+  7. Font policy: either no font at all and no font-family override in the CSS,
+     or every embedded font is declared in the manifest with a correct media
+     type and referenced from the stylesheet.
+  8. No leftover advertisement strings.
+  9. Chapter markup keeps icon and title in separate top-level blocks.
 
 Usage:
     python verify_epub.py BOOK.epub
@@ -38,6 +43,12 @@ except ImportError:  # pragma: no cover
 
 AD_NEEDLES = ["soushu2024", "soushu2025", "（本章完）"]
 IMG_SRC_RE = re.compile(r"<img\b[^>]*\bsrc\s*=\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
+FONT_MEDIA_TYPES = {
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+}
 
 
 class Result:
@@ -86,15 +97,53 @@ def main() -> int:
     opfs = [n for n in names if n.endswith(".opf")]
     r.check(len(opfs) == 1, "exactly one OPF", f"found={opfs}")
     opf_dir = posixpath.dirname(opfs[0]) if opfs else ""
+
+    opf_text = ""
+    items: list[str] = []
+
+    def attr(tag: str, name: str) -> str:
+        m = re.search(rf'\b{name}="([^"]*)"', tag)
+        return m.group(1) if m else ""
+
     if opfs:
         opf_text = z.read(opfs[0]).decode("utf-8", "ignore")
+        items = re.findall(r"<item\b[^>]*/>", opf_text)
         manifest = dict(re.findall(r'<item\b[^>]*id="([^"]+)"[^>]*href="([^"]+)"', opf_text))
         missing = [h for h in manifest.values() if posixpath.normpath(posixpath.join(opf_dir, h)) not in nameset]
         r.check(not missing, "all manifest items exist in zip", f"missing={missing[:5]}")
         r.check('properties="cover-image"' in opf_text, "OPF declares cover-image")
-        r.check('properties="nav"' not in opf_text and not any(n.endswith("nav.xhtml") for n in names),
-                "no visible EPUB 3 navigation document")
-        r.check('toc="ncx"' in opf_text and any(n.endswith("toc.ncx") for n in names), "EPUB 2 NCX is linked from spine")
+
+        # navigation: EPUB 3 nav document (required) + legacy NCX (both kept)
+        nav_items = [t for t in items if "nav" in attr(t, "properties").split()]
+        r.check(len(nav_items) == 1, 'exactly one manifest item declares properties="nav"',
+                f"found={len(nav_items)}")
+        nav_path = ""
+        if len(nav_items) == 1:
+            nav_path = posixpath.normpath(posixpath.join(opf_dir, attr(nav_items[0], "href")))
+            r.check(nav_path in nameset, "navigation document exists in the archive", nav_path)
+            spine_ids = re.findall(r'<itemref\b[^>]*idref="([^"]+)"', opf_text)
+            r.check(attr(nav_items[0], "id") not in spine_ids,
+                    "navigation document stays out of the spine (no visible TOC page)")
+
+        r.check('toc="ncx"' in opf_text and any(n.endswith("toc.ncx") for n in names),
+                "legacy NCX is linked from the spine", "kept for EPUB 2 reading systems")
+        if any(n.endswith("toc.ncx") for n in names):
+            ncx_path = [n for n in names if n.endswith("toc.ncx")][0]
+            ncx_text = z.read(ncx_path).decode("utf-8", "ignore")
+            r.check("<navPoint" in ncx_text, "NCX contains navigation points")
+
+        if nav_path and nav_path in nameset:
+            nav_text = z.read(nav_path).decode("utf-8", "ignore")
+            r.check('epub:type="toc"' in nav_text, "nav document exposes a toc nav")
+            r.check('xmlns:epub="http://www.idpf.org/2007/ops"' in nav_text,
+                    "nav document declares the epub: namespace")
+            nav_base = posixpath.dirname(nav_path)
+            dead = [
+                h for h in re.findall(r'<a\b[^>]*href="([^"]+)"', nav_text)
+                if not h.startswith(("http://", "https://", "mailto:"))
+                and posixpath.normpath(posixpath.join(nav_base, h)) not in nameset
+            ]
+            r.check(not dead, "every nav link resolves inside the EPUB", "; ".join(dead[:5]))
         r.check("<dc:title>" in opf_text and "<dc:language>" in opf_text,
                 "title and language metadata are present")
 
@@ -157,14 +206,36 @@ def main() -> int:
     else:
         r.notes.append("  INFO  no chapter icons present (skipped)")
 
-    # 6. no embedded fonts -------------------------------------------------
-    fonts = [n for n in names if n.lower().endswith((".ttf", ".otf", ".woff", ".woff2", ".ttc"))]
-    r.check(any(posixpath.basename(n) == "LXGWWenKaiMono-Regular.ttf" for n in fonts),
-            "LXGW WenKai Mono font is embedded", "; ".join(fonts[:5]))
+    # 7. font policy ---------------------------------------------------------
+    fonts = [n for n in names if n.lower().endswith((".ttf", ".otf", ".woff", ".woff2"))]
     css_files = [n for n in names if n.endswith(".css")]
     css_text = "".join(z.read(n).decode("utf-8", "ignore") for n in css_files)
-    r.check("LXGW WenKai Mono" in css_text and "../fonts/LXGWWenKaiMono-Regular.ttf" in css_text,
-            "CSS references the required font")
+    if fonts:
+        r.check("@font-face" in css_text, "CSS declares @font-face for the embedded font")
+        unreferenced = [
+            n for n in fonts
+            if f"../fonts/{posixpath.basename(n)}" not in css_text
+        ]
+        r.check(not unreferenced, "every embedded font is referenced from CSS",
+                "; ".join(posixpath.basename(n) for n in unreferenced[:5]))
+        wrong_media = []
+        for n in fonts:
+            expected = FONT_MEDIA_TYPES.get(posixpath.splitext(n)[1].lower())
+            declared = [
+                attr(t, "media-type") for t in items
+                if posixpath.basename(attr(t, "href")) == posixpath.basename(n)
+            ]
+            if expected and declared and declared[0] != expected:
+                wrong_media.append(f"{n}: {declared[0]} != {expected}")
+        r.check(not wrong_media, "embedded font has the right EPUB media-type",
+                "; ".join(wrong_media[:5]))
+        r.notes.append(f"  INFO  embedded font = {[posixpath.basename(n) for n in fonts]}")
+    else:
+        r.check("@font-face" not in css_text, "no @font-face without an embedded font")
+        r.check("font-family" not in css_text,
+                "stylesheet does not override the reader's font",
+                "default policy: reader typography wins")
+        r.notes.append("  INFO  no embedded font (reader default typography)")
 
     # 7. advertisement residue --------------------------------------------
     residue: list[str] = []

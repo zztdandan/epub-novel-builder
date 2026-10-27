@@ -16,9 +16,11 @@ Key guarantees (learned the hard way -- see SKILL.md "踩坑总结"):
   * Chapter icons are normalised onto an exact square RGBA canvas
     (default 128x128), centred, aspect preserved, never stretched.
   * Chapter icons are a separate top-of-chapter block, never nested in h1.
-  * The specified font filename is auto-discovered and embedded; callers do not
-    need to provide a font directory.
-  * NCX is retained as the bookmark/navigation source; no visible TOC page is generated.
+  * Both navigation systems are emitted: an EPUB 3 navigation document
+    (nav.xhtml, manifest-only, NOT in the spine so it never shows up as a
+    page) and a legacy NCX for EPUB 2 reading systems.
+  * The body font is NOT overridden by default: readers keep their own font.
+    Pass --font-name to embed a font and switch the body to it.
   * Only exact-match advertisement lines are removed; no fuzzy keyword
     deletion (that would eat legitimate prose).
   * mimetype is the first zip entry and is stored uncompressed.
@@ -167,10 +169,9 @@ def normalise_icon(src: Path, dst: Path, size: int) -> tuple[int, int, str]:
 # EPUB assembly
 # --------------------------------------------------------------------------
 
-CSS = """@charset "utf-8";
-html, body { margin: 0; padding: 0; }
-@font-face { font-family: "LXGW WenKai Mono"; src: url("../fonts/LXGWWenKaiMono-Regular.ttf"); font-weight: normal; font-style: normal; }
-body { color: #252525; background: #fbfaf7; font-family: "LXGW WenKai Mono", monospace; line-height: 1.75; font-size: 1em; }
+CSS_TEMPLATE = """@charset "utf-8";
+%(font_rules)shtml, body { margin: 0; padding: 0; }
+body { color: #252525; background: #fbfaf7; line-height: 1.75; font-size: 1em; }
 main { max-width: 42em; margin: 0 auto; padding: 1.2em 1.1em 3em; }
 .chapter-head { display: block; text-align: center; page-break-before: always; margin: 1.2em 0 1.8em; }
 .chapter-icon { display: block; width: 64px; height: 64px; margin: 0 auto .8em; object-fit: contain; }
@@ -197,6 +198,32 @@ p { margin: 0 0 .72em; text-indent: 2em; text-align: justify; }
 .toc a { text-decoration: none; color: #213746; }
 .toc .toc-section { margin-top: 1.1em; font-weight: 600; }
 """
+
+# Font media types accepted by EPUB 3 core media types (table 3.2).
+FONT_MEDIA_TYPES = {
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+}
+
+
+def build_css(font_name: str | None, font_href: str | None) -> str:
+    """Return book.css.
+
+    With no font, the stylesheet deliberately declares **no** font-family at
+    all: the reader's own typography settings win, which is the default policy
+    of this skill. Only an explicit --font-name switches the body to the
+    embedded face.
+    """
+    font_rules = ""
+    if font_name and font_href:
+        font_rules = (
+            f'@font-face {{ font-family: "BookBody"; src: url("{font_href}"); '
+            "font-weight: normal; font-style: normal; }\n"
+            'body { font-family: "BookBody"; }\n'
+        )
+    return CSS_TEMPLATE % {"font_rules": font_rules}
 
 CONTAINER_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <container version="1.0"
@@ -243,17 +270,29 @@ def build(args: argparse.Namespace) -> int:
     root = work / "epub"
     if root.exists():
         shutil.rmtree(root)
-    for sub in ("META-INF", "OEBPS/text", "OEBPS/images", "OEBPS/styles", "OEBPS/fonts"):
+    for sub in ("META-INF", "OEBPS/text", "OEBPS/images", "OEBPS/styles"):
         (root / sub).mkdir(parents=True, exist_ok=True)
 
-    font_path = out.parent / args.font_name
-    if not font_path.is_file():
-        font_path = Path.cwd() / args.font_name
-    if not font_path.is_file():
-        sys.stderr.write(f"ERROR: required font not found by filename: {args.font_name}\n")
-        return 4
-    font_target = root / "OEBPS" / "fonts" / args.font_name
-    shutil.copy2(font_path, font_target)
+    # Optional font embedding. Default: none -- the reader keeps its own font.
+    font_name: str | None = args.font_name.strip() if getattr(args, "font_name", "") else None
+    font_href: str | None = None
+    font_media: str | None = None
+    if font_name:
+        font_path = out.parent / font_name
+        if not font_path.is_file():
+            font_path = Path.cwd() / font_name
+        if not font_path.is_file():
+            sys.stderr.write(
+                f"ERROR: font not found by filename: {font_name}\n"
+                "Pass --font-name without a directory (the file is looked up beside\n"
+                "the output or in the current directory), or drop --font-name to\n"
+                "leave the reader's own font untouched.\n"
+            )
+            return 4
+        (root / "OEBPS" / "fonts").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(font_path, root / "OEBPS" / "fonts" / font_name)
+        font_href = f"../fonts/{font_name}"
+        font_media = FONT_MEDIA_TYPES.get(Path(font_name).suffix.lower(), "font/ttf")
 
     extra_ads = set(a for a in (args.drop_line or []) if a)
     lines, removed = strip_ad_lines(read_source(src), extra_ads)
@@ -268,7 +307,9 @@ def build(args: argparse.Namespace) -> int:
     # --- front matter / images -------------------------------------------
     (root / "mimetype").write_text("application/epub+zip", encoding="ascii")
     (root / "META-INF" / "container.xml").write_text(CONTAINER_XML, encoding="utf-8")
-    (root / "OEBPS" / "styles" / "book.css").write_text(CSS % {"icon": args.icon_size}, encoding="utf-8")
+    (root / "OEBPS" / "styles" / "book.css").write_text(
+        build_css(font_name, font_href), encoding="utf-8"
+    )
 
     images: dict[str, str] = {}  # zip name -> media type
     manifest: list[str] = []
@@ -401,12 +442,47 @@ def build(args: argparse.Namespace) -> int:
     (root / "OEBPS" / "toc.ncx").write_text(ncx, encoding="utf-8")
     manifest.append('<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>')
 
+    # --- EPUB 3 navigation document --------------------------------------
+    # Required by EPUB 3 (an EPUB 3 publication MUST contain one). It is NOT
+    # placed in the spine on purpose: the spec makes the spine optional for the
+    # navigation document, and keeping it out means no reader ever renders a
+    # visible table-of-contents page before the book. EPUB 2 reading systems
+    # ignore it and use toc.ncx instead -- so both worlds are covered.
+    nav_entries = "".join(
+        f'<li><a href="text/{html.escape(h)}">{html.escape(l)}</a></li>' for h, l in nav
+    )
+    landmarks = []
+    if cover_name:
+        landmarks.append('<li><a epub:type="cover" href="text/cover.xhtml">封面</a></li>')
+    if chapters:
+        landmarks.append('<li><a epub:type="bodymatter" href="text/ch00001.xhtml">正文</a></li>')
+    nav_doc = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE html>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml"'
+        ' xmlns:epub="http://www.idpf.org/2007/ops" lang="zh-CN" xml:lang="zh-CN">'
+        '<head><meta charset="UTF-8"/>'
+        f'<title>{html.escape(title_text)}</title>'
+        '<link rel="stylesheet" type="text/css" href="styles/book.css"/></head>'
+        '<body>'
+        f'<nav epub:type="toc" id="toc"><h1>目录</h1><ol>{nav_entries}</ol></nav>'
+        + (f'<nav epub:type="landmarks" id="landmarks" hidden=""><ol>{"".join(landmarks)}</ol></nav>'
+           if landmarks else "")
+        + "</body></html>\n"
+    )
+    (root / "OEBPS" / "nav.xhtml").write_text(nav_doc, encoding="utf-8")
+    manifest.append(
+        '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>'
+    )
+
     # --- assets in manifest ----------------------------------------------
     for name, media in images.items():
         iid = "img-" + re.sub(r"[^A-Za-z0-9]+", "-", name)
         props = ' properties="cover-image"' if name == cover_name else ""
         manifest.append(f'<item id="{iid}" href="images/{name}" media-type="{media}"{props}/>')
-    manifest.append(f'<item id="font" href="fonts/{html.escape(args.font_name)}" media-type="font/ttf"/>')
+    if font_name and font_media:
+        manifest.append(
+            f'<item id="font" href="fonts/{html.escape(font_name)}" media-type="{font_media}"/>'
+        )
     manifest.append('<item id="css" href="styles/book.css" media-type="text/css"/>')
 
     opf = (
@@ -469,7 +545,12 @@ def main() -> int:
     ap.add_argument("--work-dir", default="", help="working dir (default: <out>_work)")
     ap.add_argument("--title", default="", help="book title (default: source filename stem)")
     ap.add_argument("--author", default="", help="author name")
-    ap.add_argument("--font-name", default="LXGWWenKaiMono-Regular.ttf", help="required font filename; auto-discovered beside output or in current directory")
+    ap.add_argument(
+        "--font-name",
+        default="",
+        help="OPTIONAL font filename to embed (e.g. Book.woff2). Empty = do not override "
+        "the reader's font (default). Looked up beside --out, then in the current directory.",
+    )
     ap.add_argument("--max-image-side", type=int, default=720, help="illustration longest side px (default 720)")
     ap.add_argument("--max-image-bytes", type=int, default=200_000, help="illustration byte budget (default 200000)")
     ap.add_argument("--icon-size", type=int, default=128, help="square icon canvas px (default 128)")

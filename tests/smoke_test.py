@@ -1,30 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""End-to-end smoke test: build a tiny EPUB from synthetic input, then verify it.
+"""End-to-end smoke test: build EPUBs from synthetic input, then verify them.
 
-Everything is generated at runtime -- no binary fixtures in the repo:
-  * a plain-text novel with 6 chapters, front matter and ad lines
-  * a cover + one divider illustration (Pillow)
-  * 4 chapter icons of differing sizes (to exercise normalisation)
-  * a stand-in font file with the required filename
+Two builds, because the skill has two font policies:
+  * default  -- the reader keeps its own font (no @font-face, no font-family)
+  * --font-name -- embed a font, declare it in the manifest, reference it in CSS
+
+Everything else is generated at runtime, so the repo carries no binaries:
+a plain-text novel with 6 chapters plus ad lines, a cover, a divider,
+4 chapter icons of differing sizes, and a stand-in font file.
 
 Run:
-    python tests/smoke_test.py
-Exit code 0 means build + verify both succeeded.
+    python tests/smoke_test.py                 # scratch dir, cleaned up
+    python tests/smoke_test.py --out-dir out   # keep the .epub files (CI)
+Exit code 0 means every build + verify step succeeded.
 """
 
 from __future__ import annotations
 
+import argparse
 import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 from PIL import Image, ImageDraw
 
 REPO = Path(__file__).resolve().parent.parent
-FONT_NAME = "LXGWWenKaiMono-Regular.ttf"
+BUILD = REPO / "scripts" / "build_epub.py"
+VERIFY = REPO / "scripts" / "verify_epub.py"
+FONT_NAME = "sample-body-font.woff2"
 
 SAMPLE = """《灯下长夜》
 作者：示例作者
@@ -76,69 +83,112 @@ def _gradient(size: tuple[int, int], top: tuple[int, int, int], bottom: tuple[in
     return im
 
 
+def make_fixture(root: Path) -> dict[str, Path]:
+    images, icons = root / "images", root / "icons"
+    images.mkdir(parents=True, exist_ok=True)
+    icons.mkdir(parents=True, exist_ok=True)
+
+    source = root / "source.txt"
+    source.write_text(SAMPLE, encoding="utf-8")
+
+    # Illustrations: deliberately oversized so the budget pipeline runs.
+    _gradient((1600, 2400), (18, 30, 46), (86, 112, 138)).save(images / "cover.png")
+    _gradient((2000, 1400), (46, 38, 30), (120, 100, 78)).save(images / "divider_night.png")
+
+    # Icons: different source sizes, must all come out 128x128 RGBA.
+    for i, side in enumerate((96, 512, 130, 300)):
+        im = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        d.ellipse([2, 2, side - 3, side - 3], outline=(40, 55, 70, 255), width=max(side // 24, 2))
+        d.line([(side // 4, side // 2), (side * 3 // 4, side // 2)],
+               fill=(200, 120, 60, 255), width=max(side // 32, 2))
+        im.save(icons / f"icon-{i:03d}.png")
+
+    # Stand-in font: the builder never parses font binaries, only moves them.
+    (root / FONT_NAME).write_bytes(b"wOF2\x00\x00\x00\x00" + b"\x00" * 60)
+
+    return {"source": source, "images": images, "icons": icons, "root": root}
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    proc = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    sys.stdout.write(proc.stdout)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+    return proc
+
+
+def build_and_verify(fx: dict[str, Path], name: str, extra: list[str]) -> Path:
+    out = fx["root"] / f"{name}.epub"
+    proc = run([
+        sys.executable, str(BUILD),
+        "--src", str(fx["source"]),
+        "--out", str(out),
+        "--img-dir", str(fx["images"]),
+        "--icon-dir", str(fx["icons"]),
+        "--title", "灯下长夜",
+        "--author", "示例作者",
+        *extra,
+    ])
+    if proc.returncode != 0:
+        raise SystemExit(f"BUILD FAILED for {name} (exit {proc.returncode})")
+
+    proc = run([sys.executable, str(VERIFY), str(out)])
+    if proc.returncode != 0 or "RESULT : OK" not in proc.stdout:
+        raise SystemExit(f"VERIFY FAILED for {name} (exit {proc.returncode})")
+    return out
+
+
+def css_of(epub: Path) -> str:
+    with zipfile.ZipFile(epub) as z:
+        return "".join(
+            z.read(n).decode("utf-8")
+            for n in z.namelist()
+            if n.endswith(".css")
+        )
+
+
+def opf_of(epub: Path) -> str:
+    with zipfile.ZipFile(epub) as z:
+        return "".join(
+            z.read(n).decode("utf-8")
+            for n in z.namelist()
+            if n.endswith(".opf")
+        )
+
+
 def main() -> int:
-    tmp = Path(tempfile.mkdtemp(prefix="epub-smoke-"))
+    ap = argparse.ArgumentParser(description="Build + verify synthetic EPUBs.")
+    ap.add_argument("--out-dir", default="", help="keep build artifacts here (default: temp dir, removed)")
+    args = ap.parse_args()
+
+    keep = Path(args.out_dir).expanduser().resolve() if args.out_dir else None
+    root = keep or Path(tempfile.mkdtemp(prefix="epub-smoke-"))
+    root.mkdir(parents=True, exist_ok=True)
     try:
-        images = tmp / "images"
-        icons = tmp / "icons"
-        images.mkdir()
-        icons.mkdir()
+        fx = make_fixture(root)
 
-        source = tmp / "source.txt"
-        source.write_text(SAMPLE, encoding="utf-8")
+        # 1) default policy: the reader keeps its own font
+        plain = build_and_verify(fx, "reader-default-font", [])
+        css = css_of(plain)
+        assert "@font-face" not in css, "default build must not declare @font-face"
+        assert "font-family" not in css, "default build must not override the reader font"
 
-        # Illustrations: deliberately oversized so the budget pipeline runs.
-        _gradient((1600, 2400), (18, 30, 46), (86, 112, 138)).save(images / "cover.png")
-        _gradient((2000, 1400), (46, 38, 30), (120, 100, 78)).save(images / "divider_night.png")
-
-        # Icons: different source sizes, must all come out 128x128 RGBA.
-        for i, side in enumerate((96, 512, 130, 300)):
-            im = Image.new("RGBA", (side, side), (0, 0, 0, 0))
-            d = ImageDraw.Draw(im)
-            d.ellipse([2, 2, side - 3, side - 3], outline=(40, 55, 70, 255), width=max(side // 24, 2))
-            d.line([(side // 4, side // 2), (side * 3 // 4, side // 2)], fill=(200, 120, 60, 255), width=max(side // 32, 2))
-            im.save(icons / f"icon-{i:03d}.png")
-
-        # The builder resolves the font by filename next to the output file.
-        (tmp / FONT_NAME).write_bytes(b"\x00\x01\x00\x00" + b"\x00" * 64)
-
-        out = tmp / "sample.epub"
-        build = subprocess.run(
-            [
-                sys.executable, str(REPO / "scripts" / "build_epub.py"),
-                "--src", str(source),
-                "--out", str(out),
-                "--img-dir", str(images),
-                "--icon-dir", str(icons),
-                "--title", "灯下长夜",
-                "--author", "示例作者",
-            ],
-            capture_output=True, text=True,
-        )
-        sys.stdout.write(build.stdout)
-        if build.returncode != 0:
-            sys.stderr.write(build.stderr)
-            print(f"BUILD FAILED (exit {build.returncode})")
-            return 1
-
-        verify = subprocess.run(
-            [sys.executable, str(REPO / "scripts" / "verify_epub.py"), str(out)],
-            capture_output=True, text=True,
-        )
-        sys.stdout.write(verify.stdout)
-        if verify.returncode != 0:
-            sys.stderr.write(verify.stderr)
-            print(f"VERIFY FAILED (exit {verify.returncode})")
-            return 1
-
-        if "RESULT : OK" not in verify.stdout:
-            print("VERIFY did not report RESULT : OK")
-            return 1
+        # 2) opt-in: embed a font, declare media-type, reference it from CSS
+        embedded = build_and_verify(fx, "embedded-font", ["--font-name", FONT_NAME])
+        opf = opf_of(embedded)
+        assert 'media-type="font/woff2"' in opf, "woff2 must be declared as font/woff2"
+        assert f"../fonts/{FONT_NAME}" in css_of(embedded), "CSS must reference the embedded font"
+        with zipfile.ZipFile(embedded) as z:
+            assert f"OEBPS/fonts/{FONT_NAME}" in z.namelist(), "font file missing from the archive"
 
         print("SMOKE TEST PASSED")
+        print(f"artifacts: {plain}")
+        print(f"artifacts: {embedded}")
         return 0
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        if keep is None:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":

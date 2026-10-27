@@ -11,7 +11,8 @@
 > Agent 读完它会知道该按什么顺序做事、哪些坑不能踩；脚本负责把确定性的部分做对。
 
 **TL;DR** — An agent skill that turns a plain-text novel into a clean EPUB 3 with chapter splitting,
-ad removal, illustrations, normalised chapter icons, NCX bookmarks, embedded font, plus a verifier
+ad removal, illustrations, normalised chapter icons, dual navigation (EPUB 3 nav + EPUB 2 NCX),
+no font override (optional embedding), plus a verifier
 that catches the bugs that actually break e-readers. Windows / Linux / macOS. MIT.
 
 ---
@@ -24,7 +25,8 @@ that catches the bugs that actually break e-readers. Windows / Linux / macOS. MI
 - 整本书或部分章节白屏 → 单张插图 4 MB、2000 px，移动端阅读器直接放弃
 - 正文里正常台词被删 → 广告清理用了模糊关键词匹配
 - 章头图标大小不一、位置随屏幕宽度漂移 → 图标没归一化、被塞进 `h1`
-- 阅读器目录栏空白 → 只生成了 EPUB 3 `nav.xhtml`，老阅读器只认 `toc.ncx`
+- 阅读器目录栏空白 → 只生成了 EPUB 3 `nav.xhtml` 或只生成了 `toc.ncx`，两种阅读器各认一种
+- 读者改不了字体/字号 → 作者 CSS 用 `font-family` 把正文字体钉死了
 
 `epub-novel-builder` 把这些都写成流程约束，并配一个**逐条对应的验证器**：`verify_epub.py`
 会把上面每一条都检查一遍，一条不过就退出码 1。构建完不跑验证，等于没做完。
@@ -37,10 +39,12 @@ that catches the bugs that actually break e-readers. Windows / Linux / macOS. MI
 | 🧹 **广告清理** | 只做**精确整行**匹配 + 行首强特征正则，绝不误删正文 |
 | 🖼 **整页插图** | 自动缩到 ≤720 px、≤200 KB，转 progressive JPEG 并按质量递减试探 |
 | 🎯 **章头图标** | 统一归一化到透明正方形画布，等比缩放居中，永不拉伸 |
-| 🧭 **书签目录** | 只生成 `toc.ncx`（章 / 番外 / 分隔页 / 简介全入表），不塞可见目录页 |
-| 🔤 **字体嵌入** | 按文件名自动查找并嵌入 `LXGWWenKaiMono-Regular.ttf`，CSS 统一引用 |
+| 🧭 **双轨目录** | 同时给 `nav.xhtml`（EPUB 3 必需，只进 manifest、**不进 spine**，书前不会出现目录页）和 `toc.ncx`（章 / 番外 / 分隔页 / 简介全入表） |
+| 🔤 **不覆写字体** | 默认 CSS 不含 `font-family`，读者在阅读器里设的字体/字号说了算；需要时 `--font-name` 才嵌入并切换 |
+| ⚖️ **体积可控** | 可选字体子集化 + WOFF2：中文完整字体 26 MB → 单本书 100 KB–1 MB（[见方法](references/fonts.md)） |
 | 🧾 **规范打包** | `mimetype` 为首项且不压缩；OPF 元数据 / `cover-image` 属性完整 |
-| ✅ **验证器** | 23 项检查覆盖上述每条失败模式，CI 友好 |
+| ✅ **验证器** | 30 项断言覆盖上述每条失败模式，CI 友好 |
+| 🔍 **EPUBCheck 配套** | 提供 npm 版（免 Java）校验流程，CI 双绿灯才发版 |
 | 🪟 **跨平台** | Windows cmd/PowerShell 与 Linux/macOS bash 都有对应操作手册 |
 
 ## 安装
@@ -78,10 +82,8 @@ pip install Pillow           # 唯一必需依赖
 
 Python 3.9+。图标板切图另需 ImageMagick 7（`magick` 命令），可选。
 
-字体：仓库**不附带**字体文件。请自备
-[LXGW WenKai Mono](https://github.com/lxgw/LxgwWenKai)（OFL 许可），
-命名为 `LXGWWenKaiMono-Regular.ttf`，放在输出目录或当前执行目录即可被自动找到；
-也可以 `--font-name` 换成你自有字体的文件名。
+字体：**不需要**。默认策略是不碰字体（见 [references/fonts.md](references/fonts.md)）。
+只有在你确实要固定字体时，才自备字体文件（推荐子集化后的 `.woff2`）并用 `--font-name` 指定。
 
 ## 快速开始
 
@@ -120,7 +122,7 @@ python3 scripts/verify_epub.py --help
 | `--img-dir` | 空 | 插图目录，`cover*` 作封面，`divider*` 作分隔页 |
 | `--icon-dir` | 空 | 章节图标目录（`icon-*.png`，按序循环使用） |
 | `--title` / `--author` | 文件名 / 空 | OPF 元数据；无作者时不写 `dc:creator` |
-| `--font-name` | `LXGWWenKaiMono-Regular.ttf` | 必嵌字体文件名，自动查找 |
+| `--font-name` | 空（不嵌入） | **可选**。传了才嵌入字体并把 `body` 切到该字体；扩展名决定 media-type（ttf/otf/woff/woff2） |
 | `--max-image-side` | `720` | 整页插图最长边像素上限 |
 | `--max-image-bytes` | `200000` | 整页插图单张字节上限 |
 | `--icon-size` | `128` | 图标正方形画布边长 |
@@ -131,19 +133,19 @@ python3 scripts/verify_epub.py --help
 
 ## 验证器检查什么
 
-`scripts/verify_epub.py` 共 23 项断言，按失败模式分组，每一组都对应一个真实踩过的坑：
+`scripts/verify_epub.py` 共 30 项断言，按失败模式分组，每一组都对应一个真实踩过的坑：
 
 | # | 检查项 | 对应的失败现象 |
 |---|---|---|
 | 1 | `mimetype` 是首个 zip 条目且 STORED、内容正确 | 阅读器拒读、Calibre 报警 |
 | 2 | `container.xml` 存在；OPF 每个 manifest 项在 zip 内真实存在 | 打开后空白 / 缺页 |
 | 3 | OPF 声明 `cover-image` | 书架无缩略图 |
-| 4 | 不存在可见 `nav.xhtml`；`toc.ncx` 关联到 spine | 目录栏空白 / 书前冗长目录 |
+| 4 | nav 文档恰好一个、**不在 spine**，含 `toc` 且链接全部可解析；`toc.ncx` 关联到 spine 且有导航点 | 目录栏空白 / 书前冗长目录 / epubcheck `RSC-005` |
 | 5 | **每个 `<img src>` 相对其所在 XHTML 可解析且存在** | 封面黑块、图标正常（最隐蔽） |
 | 6 | 无根绝对路径图片引用 | 桌面阅读器正常、手机全白 |
 | 7 | 插图在像素 / 字节预算内 | 整书或章节白屏 |
 | 8 | 所有图标精确正方形 + RGBA + 尺寸一致 | 章头参差不齐 |
-| 9 | 指定字体已嵌入且 CSS 正确引用 | 自定义字体不生效 |
+| 9 | 字体策略：无字体时 CSS 无 `@font-face`/`font-family`；有字体时被引用且 media-type 正确 | 字体不生效 / 读者改不了字体 |
 | 10 | 无广告残留（`soushu20xx`、`（本章完）` 等） | 正文夹带推广行 |
 | 11 | 章节页含 `chapter-icon` 与 `chapter-title`，图标未嵌套进 `h1` | 图标漂移、标题被挤成一行 |
 
@@ -155,7 +157,7 @@ python3 scripts/verify_epub.py --help
 2. **建工作目录** — `images/` 放插图原图，`icons/` 放图标板与切图
 3. **生成插图** — 封面 2:3，提示词必写 `no text, no letters, no watermark`
 4. **生成并切图标板** — 8×8 = 64 个；密集网格切图必须降参（`--close-disk 1 --threshold 2%`）
-5. **构建** — 一条命令完成清理、分章、压图、归一化、XHTML、NCX、字体嵌入、打包
+5. **构建** — 一条命令完成清理、分章、压图、归一化、XHTML、nav + NCX 双轨目录、打包
 6. **验证** — `verify_epub.py`，必须 `RESULT : OK`
 
 生成插图 / 图标板那两步用的是另外的技能（如 `img-gen`、`gpt-icon-generate`），
@@ -169,8 +171,9 @@ python3 scripts/verify_epub.py --help
 ├── META-INF/container.xml
 └── OEBPS/
     ├── content.opf              # 元数据 + manifest + spine(toc="ncx")
-    ├── toc.ncx                  # 阅读器目录 / 书签
-    ├── fonts/LXGWWenKaiMono-Regular.ttf
+    ├── nav.xhtml                # EPUB 3 导航（必需；不在 spine，读者看不到）
+    ├── toc.ncx                  # EPUB 2 目录 / 书签
+    ├── fonts/                   # 可选：仅在传了 --font-name 时存在
     ├── styles/book.css
     ├── text/
     │   ├── cover.xhtml  titlepage.xhtml  about.xhtml
@@ -179,13 +182,33 @@ python3 scripts/verify_epub.py --help
     └── images/                  # cover.jpg / divider_*.jpg / icon-*.png
 ```
 
+## EPUBCheck（不在技能内，单独跑）
+
+技能自带验证器只覆盖它自己踩过的坑（图片路径、字节预算、图标形状、nav/spine 关系……），
+**不等于** EPUB 规范合规。发版前再跑一遍官方 EPUBCheck，两条流水线互补：
+
+```bash
+# 推荐：npm 版，不需要装 Java（TeaVM 编译版，输出与官方 jar 一致）
+npx -y epubcheck-standalone-cli@5.4.0-build3 书名.epub
+
+echo $?          # 0 = 无 error/warning，非 0 = 有问题
+```
+
+- 有 Java 的机器也可以用官方 jar：`java -jar epubcheck.jar 书名.epub`
+- 只关心结论时不看输出细节，直接看退出码即可（CI 里就是这么用的）
+- EPUBCheck **不校验字体二进制、不测阅读器兼容、不测可访问性**（可访问性用 [Ace](https://github.com/daisy/ace)）；
+  它管“是否合规”，`verify_epub.py` 管“是否真的能看”
+
+本仓库的 CI 已经这么跑（`.github/workflows/ci.yml` 的 `epubcheck` job，Node 24 + `epubcheck-standalone-cli`）。
+
 ## 已知取舍
 
-- **只用 `toc.ncx`**：EPUB 3 `nav.xhtml` 不生成。老阅读器（多看、iBooks 旧版、部分安卓阅读器）
-  只认 NCX；若你的目标读者全用现代阅读器，可以自行加回 `nav.xhtml`。
-- **CSS 有 `@font-face`，但会强制覆写正文 `font-family`**：想用系统字体请改 `styles/book.css`。
-- **不加 `epubcheck`**：验证器只覆盖本技能踩过的坑，不等价于完整 EPUBCheck 合规。
-  正式发布前建议再跑一遍 [epubcheck](https://github.com/w3c/epubcheck)。
+- **nav 不进 spine**：符合规范（「Although EPUB Publications have to include an EPUB Navigation Document,
+  it is not mandatory to include it in the spine」），也因此永远不会被渲染成书前目录页。
+  代价是：如果你的目标阅读器只能靠 spine 里的目录页导航（极端少见的旧设备），它看不到 nav。
+- **默认不覆写字体**：正文用阅读器默认字体。想固定排版就传 `--font-name`，
+  但请先子集化，否则一本书的字体就能顶到 26 MB（[实测数字](references/fonts.md)）。
+- **不内建 EPUBCheck**：技能保持“零 Java 依赖”，规范校验交给上面的 npm 流程 / CI。
 
 ## 平台支持
 
@@ -196,28 +219,31 @@ python3 scripts/verify_epub.py --help
 
 两份参考文档覆盖：Pillow / ImageMagick 安装、here-doc、locale 与 `PYTHONIOENCODING`、
 中文代码页、`WinError 32`（文件被阅读器占用）处理。
+字体相关的可选分支另见 [references/fonts.md](references/fonts.md)（嵌入、子集化、WOFF2、OFL 许可）。
 
 ## 开发与测试
 
 ```bash
 pip install Pillow
-python tests/smoke_test.py          # 合成一部 6 章小说 → 构建 → 验证，CI 跑的就是它
+python tests/smoke_test.py                  # 两种字体策略各构一本 + 验证（CI 跑的就是它）
+python tests/smoke_test.py --out-dir out    # 保留产物，供 EPUBCheck 复核
 ```
 
 冒烟测试全部在运行时生成夹具（小说文本、封面、分隔页、4 个不同尺寸图标、占位字体），
-仓库里没有二进制资源。
+仓库里没有二进制资源。两本产物分别覆盖：**默认不覆写字体**、**`--font-name` 嵌入字体**。
 
 ## 目录
 
 ```
 epub-novel-builder/
-├── SKILL.md                 # Agent 指令（流程、9 个坑、参数表）
+├── SKILL.md                 # Agent 指令（流程、10 个坑、参数表）
 ├── scripts/
 │   ├── build_epub.py        # 构建器
-│   └── verify_epub.py       # 验证器（23 项检查）
+│   └── verify_epub.py       # 验证器（30 项断言）
 ├── references/
 │   ├── windows.md
-│   └── linux.md
+│   ├── linux.md
+│   └── fonts.md             # 可选分支：字体嵌入与子集化
 ├── tests/smoke_test.py
 ├── .github/workflows/ci.yml
 ├── requirements.txt
@@ -227,5 +253,5 @@ epub-novel-builder/
 ## 许可
 
 代码与文档：[MIT](LICENSE)。
-字体（LXGW WenKai Mono）与生成的插图不在本仓库内，请遵循各自许可（OFL / 你所用出图服务条款）。
+生成的插图与可选嵌入的字体不在本仓库内，请遵循各自许可（字体常见为 OFL，须随书附许可文本）。
 本技能不提供、不内置任何小说文本。
