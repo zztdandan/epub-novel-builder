@@ -1,0 +1,2 @@
+# Only runtime dependency. Debian/Ubuntu equivalent: apt install python3-pil
+Pillow>=9.1
